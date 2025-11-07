@@ -35,7 +35,6 @@ class ImovelwebScraper:
     # Settings (unchanged)
     LOAD_TIMEOUT = 15
     BROWSER_LOCALE = "pt-br"
-    FAILED_DIR = "failed_page_loads"
 
     # ========================================================================
     # INITIALIZATION - MODIFIED
@@ -44,18 +43,23 @@ class ImovelwebScraper:
     def __init__(self, redis_clients: dict):
         """
         Initialize scraper with new Redis clients.
-        
+
         Args:
-            redis_clients: Dict with 'scrape_session', 'processed_urls', 'url_stream' clients
+            redis_clients: Dict with 'scrape_session', 'processed_urls', 'url_stream', 'airtable_tasks' clients
         """
         self.scrape_session = redis_clients['scrape_session']
         self.processed_urls = redis_clients['processed_urls']
         self.url_stream = redis_clients['url_stream']
+        self.airtable_tasks = redis_clients['airtable_tasks']
+        self.site_name = redis_clients['scrape_session'].site_name
         self.sb = None
+
+        # Screenshot directory (environment variable for Docker compatibility)
+        self.FAILED_DIR = os.getenv('FAILED_SCREENSHOTS_DIR', 'failed_page_loads')
 
         # Ensure failed directory exists
         os.makedirs(self.FAILED_DIR, exist_ok=True)
-        
+
         logger.debug("Scraper initialized with Redis clients")
 
             # ========================================================================
@@ -277,13 +281,13 @@ class ImovelwebScraper:
 
         return False
     
-    def handle_captcha(self, max_wait: int = 30) -> bool:
+    def handle_captcha(self, max_wait: int = 60) -> bool:
         """
         Wait for SeleniumBase UC mode to solve captcha.
-        
+
         Args:
-            max_wait: Maximum time to wait (seconds)
-            
+            max_wait: Maximum time to wait (seconds, default 60)
+
         Returns:
             True if captcha cleared
         """
@@ -501,7 +505,7 @@ class ImovelwebScraper:
             historical_data = existing_data.get(url)
 
             if historical_data:
-                # URL exists in processed_urls
+                # URL exists in processed_urls (worker already scraped it)
                 historical_price = historical_data.get('price')
 
                 if historical_price == current_price:
@@ -509,22 +513,21 @@ class ImovelwebScraper:
                     stats['duplicates'] += 1
                     continue  # Skip: no stream publish, no processed_urls update
                 else:
-                    # PRICE CHANGE: update price in processed_urls, but don't publish to stream
-                    # (worker already scraped full details, we just need to update the price)
+                    # PRICE CHANGE: update price in processed_urls only
+                    # (worker already has full details, just update the price)
                     stats['price_changes'] += 1
-                    # Note: urls_to_publish NOT added - price changes don't need worker processing
+
+                    # Update only the price, preserve all other worker data
+                    processed_updates[url] = {
+                        **historical_data,  # Keep all existing worker data
+                        'price': current_price  # Update only price
+                    }
             else:
-                # NEW URL: publish to stream for worker to scrape full details
+                # NEW URL: publish to stream for worker to add to processed_urls
+                # Scraper does NOT add to processed_urls for new URLs
                 stats['new'] += 1
                 urls_to_publish.append((url, 'new'))
-
-            # Prepare processed_urls update (for NEW and PRICE_CHANGE, not duplicates)
-            processed_updates[url] = {
-                'price': current_price,
-                'last_seen': time.time(),
-                'first_seen': historical_data.get('first_seen', time.time()) if historical_data else time.time(),
-                **metadata
-            }
+                # Note: No processed_updates for NEW urls - worker will add the full record
 
         # ✅ BATCH 2: Update scrape_session in single HSET operation
         if scrape_session_updates:
@@ -537,13 +540,23 @@ class ImovelwebScraper:
         if urls_to_publish:
             self.url_stream.publish_urls_batch(urls_to_publish)
 
-        # ✅ BATCH 4: Update processed_urls in single HSET operation with mapping
+        # ✅ BATCH 4: Update processed_urls ONLY for price changes (not new URLs)
         if processed_updates:
             serialized_updates = {url: json.dumps(data) for url, data in processed_updates.items()}
             self.processed_urls.client.hset(
                 self.processed_urls.processed_key,
                 mapping=serialized_updates
             )
+
+        # ✅ BATCH 5: Queue Airtable tasks for price changes
+        if processed_updates:
+            for url, data in processed_updates.items():
+                self.airtable_tasks.publish_task(
+                    site=self.site_name,
+                    action='update',
+                    url=url,
+                    fields={'price': data['price']}
+                )
 
         logger.info(f"📊 Batch: {len(normalized_pairs)} URLs → "
                 f"🆕{stats['new']} 💰{stats['price_changes']} 🔄{stats['duplicates']}")

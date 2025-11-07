@@ -8,11 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from seleniumbase import sb_cdp
 
-# Add parent directory to path to import from provider
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-# Import from our modules
-from provider.redis_client import create_redis_clients
+# Import from local modules
+from redis_client import create_redis_clients
 from parser import parse_property_data
 
 # Site-specific configuration
@@ -186,6 +183,7 @@ def persistent_worker(worker_id, redis_clients):
     url_stream = redis_clients['url_stream']
     processed_urls = redis_clients['processed_urls']
     failed_urls = redis_clients['failed_urls']
+    airtable_tasks = redis_clients['airtable_tasks']
 
     try:
         sb = sb_cdp.Chrome(uc=True, uc_cdp_events=True, locale="pt-br")
@@ -311,6 +309,13 @@ def persistent_worker(worker_id, redis_clients):
                 # Save to Redis processed_urls Hash
                 try:
                     processed_urls.update_full_data(url, property_data)
+
+                    # Queue Airtable sync task for new URL
+                    airtable_tasks.publish_task(
+                        site=SITE_NAME,
+                        action='add',
+                        url=url
+                    )
                 except Exception as e:
                     error_msg = f"Redis save failed: {str(e)[:100]}"
                     logger.error(f"[{thread_name}] {error_msg}")
