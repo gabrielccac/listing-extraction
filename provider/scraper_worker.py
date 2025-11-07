@@ -35,7 +35,6 @@ class ImovelwebScraper:
     # Settings (unchanged)
     LOAD_TIMEOUT = 15
     BROWSER_LOCALE = "pt-br"
-    FAILED_DIR = "failed_page_loads"
 
     # ========================================================================
     # INITIALIZATION - MODIFIED
@@ -54,6 +53,9 @@ class ImovelwebScraper:
         self.airtable_tasks = redis_clients['airtable_tasks']
         self.site_name = redis_clients['scrape_session'].site_name
         self.sb = None
+
+        # Screenshot directory (environment variable for Docker compatibility)
+        self.FAILED_DIR = os.getenv('FAILED_SCREENSHOTS_DIR', 'failed_page_loads')
 
         # Ensure failed directory exists
         os.makedirs(self.FAILED_DIR, exist_ok=True)
@@ -279,13 +281,13 @@ class ImovelwebScraper:
 
         return False
     
-    def handle_captcha(self, max_wait: int = 30) -> bool:
+    def handle_captcha(self, max_wait: int = 60) -> bool:
         """
         Wait for SeleniumBase UC mode to solve captcha.
-        
+
         Args:
-            max_wait: Maximum time to wait (seconds)
-            
+            max_wait: Maximum time to wait (seconds, default 60)
+
         Returns:
             True if captcha cleared
         """

@@ -14,6 +14,7 @@ MAX_WORKERS = 3
 SUB_REGIONS = ["brasilia-df"]
 TRANSACTION_TYPES = ["venda", "aluguel"]
 MAX_RETRIES = 3
+MAX_NAV_RETRIES = 3  # Retries for navigation failures
 PAGES_PER_CHUNK = 150
 MAX_PAGES = 600
 
@@ -230,10 +231,22 @@ def scrape_task(task):
         # CHANGED: No session_hash needed anymore
         metadata = {'sub_region': task['sub_region'], 'transaction_type': task['transaction_type']}
 
-        # Navigate to first page of chunk
+        # Navigate to first page of chunk with retries
         first_page_url = scraper.get_page_url(task, start_page)
-        if not scraper.navigate(first_page_url):
-            logger.error(f"[{key}] Failed to navigate to start page {start_page}")
+        nav_success = False
+        for attempt in range(MAX_NAV_RETRIES):
+            if scraper.navigate(first_page_url):
+                nav_success = True
+                break
+
+            logger.warning(f"[{key}] Navigation attempt {attempt+1}/{MAX_NAV_RETRIES} failed for start page {start_page}")
+
+            if attempt < MAX_NAV_RETRIES - 1:
+                logger.info(f"[{key}] Restarting browser and retrying...")
+                scraper.restart_browser()
+
+        if not nav_success:
+            logger.error(f"[{key}] Failed to navigate to start page {start_page} after {MAX_NAV_RETRIES} attempts, skipping chunk")
             return
 
         # Loop through all pages in chunk
@@ -284,8 +297,22 @@ def scrape_task(task):
                 else:
                     logger.warning(f"[{key}] Click failed, using direct URL for page {expected_next_page}")
                     next_page_url = scraper.get_page_url(task, expected_next_page)
-                    if not scraper.navigate(next_page_url):
-                        logger.error(f"[{key}] Failed to navigate to page {expected_next_page}, stopping chunk")
+
+                    # Try navigation with retries
+                    nav_success = False
+                    for attempt in range(MAX_NAV_RETRIES):
+                        if scraper.navigate(next_page_url):
+                            nav_success = True
+                            break
+
+                        logger.warning(f"[{key}] Navigation attempt {attempt+1}/{MAX_NAV_RETRIES} failed for page {expected_next_page}")
+
+                        if attempt < MAX_NAV_RETRIES - 1:
+                            logger.info(f"[{key}] Restarting browser and retrying...")
+                            scraper.restart_browser()
+
+                    if not nav_success:
+                        logger.error(f"[{key}] Failed to navigate to page {expected_next_page} after {MAX_NAV_RETRIES} attempts, stopping chunk")
                         break
 
                 time.sleep(1)
