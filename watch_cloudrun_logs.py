@@ -11,7 +11,10 @@ import subprocess
 import time
 import sys
 import json
+import platform
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 import argparse
 
 # Configuration
@@ -21,11 +24,51 @@ JOB_NAME = "exp-scraper-job"
 POLL_INTERVAL = 3  # seconds
 
 
+def get_gcloud_command():
+    """Get the correct gcloud command for the platform"""
+    # Try to find gcloud in PATH
+    gcloud_cmd = shutil.which("gcloud")
+
+    if gcloud_cmd:
+        return gcloud_cmd
+
+    # On Windows, try gcloud.cmd
+    if platform.system() == "Windows":
+        gcloud_cmd = shutil.which("gcloud.cmd")
+        if gcloud_cmd:
+            return gcloud_cmd
+
+        # Try common Windows installation paths
+        common_paths = [
+            Path.home() / "AppData/Local/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.cmd",
+            Path("C:/Program Files (x86)/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.cmd"),
+            Path("C:/Program Files/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.cmd"),
+        ]
+
+        for path in common_paths:
+            if path.exists():
+                return str(path)
+
+    # Not found
+    print("❌ gcloud command not found!")
+    print("Please install Google Cloud SDK: https://cloud.google.com/sdk/docs/install")
+    print("\nOr add gcloud to your PATH:")
+    if platform.system() == "Windows":
+        print("  Add this to PATH: C:\\Program Files (x86)\\Google\\Cloud SDK\\google-cloud-sdk\\bin")
+    else:
+        print("  Add this to PATH: ~/google-cloud-sdk/bin")
+    sys.exit(1)
+
+
+# Get gcloud command at startup
+GCLOUD_CMD = get_gcloud_command()
+
+
 def get_latest_execution():
     """Get the most recent execution ID"""
     try:
         cmd = [
-            "gcloud", "run", "jobs", "executions", "list",
+            GCLOUD_CMD, "run", "jobs", "executions", "list",
             f"--job={JOB_NAME}",
             f"--region={REGION}",
             "--limit=1",
@@ -64,7 +107,7 @@ def fetch_logs(execution_name=None, last_timestamp=None):
         filter_str += f' AND timestamp>"{last_timestamp}"'
 
     cmd = [
-        "gcloud", "logging", "read",
+        GCLOUD_CMD, "logging", "read",
         filter_str,
         "--limit=100",
         "--format=json",
