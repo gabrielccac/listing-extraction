@@ -4,11 +4,14 @@ Manager - Syncs Redis processed_urls with Airtable
 
 Responsibilities:
 1. Find EXPIRED urls: processed_urls - scrape_session → Queue delete tasks
-2. Find NEW urls: processed_urls without airtable_record_id → Queue add tasks (backup)
-3. Queue tasks to unified airtable_tasks stream
+2. Remove expired URLs from processed_urls
+3. Queue delete tasks to unified airtable_tasks stream
+
+Note: Initial Airtable population is done manually via CSV export.
+      After that, worker queues 'add' tasks for new URLs automatically.
 
 Usage:
-    python manager.py --site imovelweb
+    python common/manager.py --site imovelweb
 """
 
 import argparse
@@ -92,27 +95,6 @@ class Manager:
 
         return expired
 
-    def find_new_urls(self):
-        """
-        Find URLs in processed_urls that don't have airtable_record_id yet.
-        This is a backup check - normally worker queues 'add' tasks immediately.
-
-        Returns: Set of new URLs
-        """
-        logger.info("🔍 Finding new URLs without Airtable record_id...")
-
-        all_urls = self.processed_urls.get_all_urls()
-        new_urls = set()
-
-        for url in all_urls:
-            data = self.processed_urls.get_url_data(url)
-            if data and not data.get('airtable_record_id'):
-                new_urls.add(url)
-
-        logger.info(f"   URLs without record_id: {len(new_urls):,}")
-
-        return new_urls
-
     def queue_delete_tasks(self, expired_urls):
         """
         Queue delete tasks for expired URLs.
@@ -137,48 +119,23 @@ class Manager:
 
         logger.info(f"✅ Queued {len(expired_urls):,} delete tasks")
 
-    def queue_add_tasks(self, new_urls):
-        """
-        Queue add tasks for new URLs without airtable_record_id.
-        This is a backup - normally worker handles this.
-        """
-        if not new_urls:
-            logger.info("✅ No new URLs to add")
-            return
-
-        logger.info(f"📋 Queueing {len(new_urls):,} add tasks (backup)...")
-
-        for url in new_urls:
-            self.airtable_tasks.publish_task(
-                site=self.site_name,
-                action='add',
-                url=url
-            )
-
-        logger.info(f"✅ Queued {len(new_urls):,} add tasks")
-
     def run(self):
         """Run the manager sync process."""
         logger.info("=" * 60)
         logger.info(f"MANAGER SYNC - {self.site_name.upper()}")
         logger.info("=" * 60)
 
-        # 1. Find and queue expired URLs
+        # Find and queue expired URLs
         expired_urls = self.find_expired_urls()
         self.queue_delete_tasks(expired_urls)
 
-        # 2. Find and queue new URLs (backup check)
-        new_urls = self.find_new_urls()
-        self.queue_add_tasks(new_urls)
-
-        # 3. Show summary
+        # Show summary
         stream_length = self.airtable_tasks.get_stream_length()
 
         logger.info("=" * 60)
         logger.info("MANAGER SYNC COMPLETE")
         logger.info("=" * 60)
         logger.info(f"Expired URLs queued for deletion: {len(expired_urls):,}")
-        logger.info(f"New URLs queued for addition:     {len(new_urls):,}")
         logger.info(f"Airtable tasks in queue:          {stream_length:,}")
         logger.info("=" * 60)
 

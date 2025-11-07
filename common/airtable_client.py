@@ -3,13 +3,15 @@
 Airtable Client - Consumes tasks from airtable_tasks stream and syncs with Airtable
 
 Unified consumer for all sites. Handles:
-- add: Create new record in Airtable
-- update: Update existing record in Airtable
-- delete: Delete record from Airtable
+- add: Create new record in Airtable (fetches data from processed_urls)
+- update: Update existing record in Airtable (searches by URL)
+- delete: Delete record from Airtable (searches by URL)
+
+Note: Does not store airtable_record_id in Redis. All operations search by URL field.
 
 Usage:
-    python airtable_client.py
-    python airtable_client.py --consumer-name worker1
+    python common/airtable_client.py
+    python common/airtable_client.py --consumer-name worker1
 """
 
 import argparse
@@ -284,17 +286,6 @@ class AirtableTaskConsumer:
             if not record_id:
                 return False
 
-            # Store record_id back in processed_urls
-            processed_urls.client.hset(
-                processed_urls.processed_key,
-                url,
-                json.dumps({
-                    **data,
-                    'airtable_record_id': record_id,
-                    'last_synced': time.time()
-                })
-            )
-
             logger.info(f"✅ ADD: Created record {record_id} for {url[:60]}")
             return True
 
@@ -315,48 +306,17 @@ class AirtableTaskConsumer:
             True if successful, False otherwise
         """
         try:
-            # Get data from processed_urls (to get record_id)
-            processed_urls = self.get_processed_urls_client(site)
-            data = processed_urls.get_url_data(url)
-
-            if not data:
-                logger.error(f"❌ No data found in processed_urls for {url[:60]}")
-                return False
-
-            record_id = data.get('airtable_record_id')
+            # Find record by URL in Airtable
+            record_id = self.airtable.find_record_by_url(url)
 
             if not record_id:
-                # Backup: try to find record by URL
-                logger.warning(f"⚠️  No record_id in processed_urls, searching by URL...")
-                record_id = self.airtable.find_record_by_url(url)
-
-                if record_id:
-                    # Store found record_id
-                    processed_urls.client.hset(
-                        processed_urls.processed_key,
-                        url,
-                        json.dumps({
-                            **data,
-                            'airtable_record_id': record_id
-                        })
-                    )
-                else:
-                    logger.error(f"❌ No record found in Airtable for {url[:60]}")
-                    return False
+                logger.warning(f"⚠️  No record found in Airtable for {url[:60]} (might not be synced yet)")
+                return False
 
             # Update record in Airtable
             success = self.airtable.update_record(record_id, fields)
 
             if success:
-                # Update last_synced timestamp
-                processed_urls.client.hset(
-                    processed_urls.processed_key,
-                    url,
-                    json.dumps({
-                        **data,
-                        'last_synced': time.time()
-                    })
-                )
                 logger.info(f"✅ UPDATE: Updated record {record_id} for {url[:60]}")
 
             return success
@@ -377,9 +337,7 @@ class AirtableTaskConsumer:
             True if successful, False otherwise
         """
         try:
-            # Get data from processed_urls (to get record_id)
-            # Note: Manager already deleted from processed_urls, so this might fail
-            # We can try to find by URL instead
+            # Find record by URL in Airtable
             record_id = self.airtable.find_record_by_url(url)
 
             if not record_id:
