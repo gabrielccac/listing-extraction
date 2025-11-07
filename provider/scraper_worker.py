@@ -495,25 +495,30 @@ class ImovelwebScraper:
 
         # Process in batch
         for url, current_price in normalized_pairs:
-            # Always update scrape_session
+            # Always update scrape_session (for expired detection)
             scrape_session_updates[url] = current_price
 
             historical_data = existing_data.get(url)
 
             if historical_data:
+                # URL exists in processed_urls
                 historical_price = historical_data.get('price')
 
                 if historical_price == current_price:
+                    # DUPLICATE: same price, no changes needed
                     stats['duplicates'] += 1
-                    continue
+                    continue  # Skip: no stream publish, no processed_urls update
                 else:
+                    # PRICE CHANGE: update price in processed_urls, but don't publish to stream
+                    # (worker already scraped full details, we just need to update the price)
                     stats['price_changes'] += 1
-                    urls_to_publish.append((url, 'price_update'))
+                    # Note: urls_to_publish NOT added - price changes don't need worker processing
             else:
+                # NEW URL: publish to stream for worker to scrape full details
                 stats['new'] += 1
                 urls_to_publish.append((url, 'new'))
 
-            # Prepare processed_urls update
+            # Prepare processed_urls update (for NEW and PRICE_CHANGE, not duplicates)
             processed_updates[url] = {
                 'price': current_price,
                 'last_seen': time.time(),
