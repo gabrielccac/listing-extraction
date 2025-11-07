@@ -1,7 +1,6 @@
 import time
 import logging
 import threading
-import json
 import os
 import sys
 import signal
@@ -16,7 +15,6 @@ from parser import parse_property_data
 
 # Import pika and redis for compatibility with existing code
 import pika
-import redis
 
 # Site-specific configuration
 SITE_NAME = 'imovelweb'
@@ -31,7 +29,7 @@ for l in ["seleniumbase", "selenium", "pika"]: logging.getLogger(l).setLevel(log
 
 # Configuration
 MAX_RETRIES = 3
-MAX_WORKERS = int(os.getenv('MAX_WORKERS', '1'))
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', '3'))
 
 # CSV Output file - unique per consumer instance
 CONSUMER_ID = os.getpid()
@@ -278,15 +276,6 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
             # Get retry count
             with results_lock:
                 retry_count = url_retry_counts.get(url, 0)
-                
-            # Check if already processed in Redis
-            if redis_client.sismember(REDIS_PROCESSED_SET, url):
-                logger.info(f"[{thread_name}] ⏭️  Skipping already processed URL: {url}")
-                if delivery_tag:
-                    with mq_lock:
-                        if not shutdown_event.is_set():
-                            mq_channel.basic_ack(delivery_tag=delivery_tag)
-                continue
 
             # Check shutdown before processing
             if shutdown_event.is_set():

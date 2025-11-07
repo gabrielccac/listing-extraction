@@ -317,3 +317,126 @@ def create_queue_manager(site_name: str) -> QueueManager:
         password='rabbitmqpass',
         queue_name=f'scraped_urls_{site_name}'  # Changed to match consumer convention
     )
+
+# Add these functions to your existing queue_client.py
+
+def create_redis_result_store(site_name: str):
+    """
+    Create Redis client for storing processed results as JSON.
+    
+    Args:
+        site_name: Site identifier (e.g., 'imovelweb')
+        
+    Returns:
+        RedisResultStore instance
+    """
+    redis_hash_name = f'processed_results_{site_name}'
+    
+    return RedisResultStore(
+        host='5.161.248.214',
+        port=6379,
+        password='redispass',
+        hash_name=redis_hash_name
+    )
+
+
+class RedisResultStore:
+    """
+    Thread-safe Redis client for storing processed listing results as JSON.
+    """
+    
+    def __init__(self, host: str, port: int, password: str, hash_name: str):
+        self.host = host
+        self.port = port
+        self.hash_name = hash_name
+
+        try:
+            self.client = redis.Redis(
+                host=host,
+                port=port,
+                password=password,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=5
+            )
+            # Test connection
+            self.client.ping()
+            logger.debug(f"✅ Connected to Redis at {host}:{port} (hash: {hash_name})")
+        except redis.ConnectionError as e:
+            logger.error(f"❌ Failed to connect to Redis at {host}:{port}: {e}")
+            raise
+
+    def store_result(self, url: str, result_obj: dict) -> bool:
+        """
+        Store a processed result in Redis hash as JSON.
+        
+        Args:
+            url: URL as the hash field (key)
+            result_obj: Full result object (will be stored as JSON)
+            
+        Returns:
+            True if stored successfully
+        """
+        try:
+            import json
+            value_json = json.dumps(result_obj, ensure_ascii=False)
+            self.client.hset(self.hash_name, url, value_json)
+            logger.debug(f"✅ Stored JSON result for URL: {url[:100]}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error storing result in Redis: {e}")
+            return False
+
+    def get_result(self, url: str) -> Optional[dict]:
+        """
+        Get a stored result from Redis hash.
+        
+        Args:
+            url: URL to retrieve
+            
+        Returns:
+            Result dict if found, None otherwise
+        """
+        try:
+            import json
+            value_json = self.client.hget(self.hash_name, url)
+            if value_json:
+                return json.loads(value_json)
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error retrieving result from Redis: {e}")
+            return None
+
+    def remove_url(self, url: str):
+        """
+        Remove a URL from Redis hash.
+        
+        Args:
+            url: URL to remove
+        """
+        try:
+            self.client.hdel(self.hash_name, url)
+            logger.debug(f"✅ Removed URL from Redis: {url[:100]}")
+        except Exception as e:
+            logger.error(f"❌ Error removing URL from Redis: {e}")
+
+    def get_total_count(self) -> int:
+        """
+        Get total number of URLs in Redis hash.
+        
+        Returns:
+            Total count of URLs in hash
+        """
+        try:
+            return self.client.hlen(self.hash_name)
+        except Exception as e:
+            logger.error(f"❌ Error getting count from Redis: {e}")
+            return 0
+
+    def close(self):
+        """Close Redis connection."""
+        try:
+            self.client.close()
+            logger.debug("✅ Redis connection closed")
+        except Exception as e:
+            logger.warning(f"⚠️ Error closing Redis connection: {e}")
