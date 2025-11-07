@@ -262,20 +262,112 @@ class FailedUrlsClient(RedisClient):
         self.client.delete(self.failed_key)
         logger.info(f"🧹 Cleared {count} failed URLs")
 
+class AirtableTasksClient(RedisClient):
+    """
+    Manages unified Airtable sync task queue (all sites).
+    Stream is shared across all sites for unified rate limiting.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stream_key = "airtable_tasks"  # Unified, no site suffix
+        self.consumer_group = "airtable_workers"
+
+    def publish_task(self, site: str, action: str, url: str, fields: Dict = None):
+        """
+        Publish Airtable sync task to unified queue.
+
+        Args:
+            site: Site name (e.g., 'imovelweb')
+            action: 'add', 'update', or 'delete'
+            url: Property URL
+            fields: Optional fields for update action
+        """
+        message = {
+            'site': site,
+            'action': action,
+            'url': url,
+            'timestamp': str(time.time()),
+            'retry_count': '0'
+        }
+
+        if fields:
+            message['fields'] = json.dumps(fields)
+
+        message_id = self.client.xadd(self.stream_key, message)
+        logger.debug(f"📋 Airtable task queued: {action} {url[:60]} (site: {site})")
+        return message_id
+
+    def create_consumer_group(self):
+        """Create consumer group for Airtable workers (idempotent)."""
+        try:
+            self.client.xgroup_create(
+                self.stream_key,
+                self.consumer_group,
+                id='0',
+                mkstream=True
+            )
+            logger.info(f"✅ Created Airtable consumer group: {self.consumer_group}")
+        except redis.exceptions.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                logger.debug(f"Airtable consumer group already exists")
+            else:
+                raise
+
+    def consume_tasks(self, consumer_name: str, count: int = 1, block_ms: int = 5000):
+        """
+        Consume tasks from Airtable queue (blocking).
+
+        Returns: List of (message_id, task_dict)
+        """
+        try:
+            messages = self.client.xreadgroup(
+                groupname=self.consumer_group,
+                consumername=consumer_name,
+                streams={self.stream_key: '>'},
+                count=count,
+                block=block_ms
+            )
+
+            results = []
+            for stream, message_list in messages:
+                for message_id, fields in message_list:
+                    # Parse fields JSON if present
+                    task = dict(fields)
+                    if 'fields' in task:
+                        task['fields'] = json.loads(task['fields'])
+                    results.append((message_id, task))
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Airtable task consumption error: {e}")
+            return []
+
+    def ack_message(self, message_id: str):
+        """Acknowledge task completion."""
+        self.client.xack(self.stream_key, self.consumer_group, message_id)
+
+    def get_stream_length(self) -> int:
+        """Get total number of messages in stream."""
+        return self.client.xlen(self.stream_key)
+
 # Factory function for worker
 def create_redis_clients(site_name: str, host: str, port: int, password: str):
     """Create Redis clients needed for worker."""
     clients = {
         'processed_urls': ProcessedUrlsClient(site_name, host, port, password, db=0),
         'url_stream': UrlStreamClient(site_name, host, port, password, db=0),
-        'failed_urls': FailedUrlsClient(site_name, host, port, password, db=0)
+        'failed_urls': FailedUrlsClient(site_name, host, port, password, db=0),
+        'airtable_tasks': AirtableTasksClient(host, port, password, db=0),
     }
 
     # Connect all clients
     for name, client in clients.items():
         client.connect()
 
-    # Ensure stream consumer group exists
+    # Ensure stream consumer groups exist
     clients['url_stream'].create_consumer_group()
+    clients['airtable_tasks'].create_consumer_group()
 
     return clients

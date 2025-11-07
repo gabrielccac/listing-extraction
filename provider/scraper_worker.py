@@ -44,18 +44,20 @@ class ImovelwebScraper:
     def __init__(self, redis_clients: dict):
         """
         Initialize scraper with new Redis clients.
-        
+
         Args:
-            redis_clients: Dict with 'scrape_session', 'processed_urls', 'url_stream' clients
+            redis_clients: Dict with 'scrape_session', 'processed_urls', 'url_stream', 'airtable_tasks' clients
         """
         self.scrape_session = redis_clients['scrape_session']
         self.processed_urls = redis_clients['processed_urls']
         self.url_stream = redis_clients['url_stream']
+        self.airtable_tasks = redis_clients['airtable_tasks']
+        self.site_name = redis_clients['scrape_session'].site_name
         self.sb = None
 
         # Ensure failed directory exists
         os.makedirs(self.FAILED_DIR, exist_ok=True)
-        
+
         logger.debug("Scraper initialized with Redis clients")
 
             # ========================================================================
@@ -543,6 +545,16 @@ class ImovelwebScraper:
                 self.processed_urls.processed_key,
                 mapping=serialized_updates
             )
+
+        # ✅ BATCH 5: Queue Airtable tasks for price changes
+        if processed_updates:
+            for url, data in processed_updates.items():
+                self.airtable_tasks.publish_task(
+                    site=self.site_name,
+                    action='update',
+                    url=url,
+                    fields={'price': data['price']}
+                )
 
         logger.info(f"📊 Batch: {len(normalized_pairs)} URLs → "
                 f"🆕{stats['new']} 💰{stats['price_changes']} 🔄{stats['duplicates']}")
