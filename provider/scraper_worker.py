@@ -471,17 +471,27 @@ class ImovelwebScraper:
         if not url_price_pairs:
             return {'new': 0, 'price_changes': 0, 'duplicates': 0}
 
+        # Filter out URLs with None prices (Redis doesn't accept None values)
+        valid_pairs = [(url, price) for url, price in url_price_pairs if price is not None]
+        skipped = len(url_price_pairs) - len(valid_pairs)
+
+        if skipped > 0:
+            logger.warning(f"⚠️ Skipped {skipped} URLs with None prices")
+
+        if not valid_pairs:
+            return {'new': 0, 'price_changes': 0, 'duplicates': 0}
+
         stats = {'new': 0, 'price_changes': 0, 'duplicates': 0}
         urls_to_publish = []
         scrape_session_updates = {}
         processed_updates = {}
 
         # ✅ BATCH 1: Get all existing data in single HMGET operation
-        urls = [url for url, _ in url_price_pairs]
+        urls = [url for url, _ in valid_pairs]
         existing_data = self.processed_urls.get_urls_batch(urls)
 
         # Process in batch
-        for url, current_price in url_price_pairs:
+        for url, current_price in valid_pairs:
             # Always update scrape_session
             scrape_session_updates[url] = current_price
 
@@ -527,7 +537,7 @@ class ImovelwebScraper:
                 mapping=serialized_updates
             )
 
-        logger.info(f"📊 Batch: {len(url_price_pairs)} URLs → "
+        logger.info(f"📊 Batch: {len(valid_pairs)} URLs → "
                 f"🆕{stats['new']} 💰{stats['price_changes']} 🔄{stats['duplicates']}")
 
         return stats
