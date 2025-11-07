@@ -3,3 +3,4 @@ env/
 __pycache__/
 failed_urls/
 imovelweb_listings_*
+.env

@@ -28,12 +28,6 @@ def format_size(num: int) -> str:
     """Format number with thousands separators"""
     return f"{num:,}"
 
-def truncate_string(s: str, length: int = 100) -> str:
-    """Truncate string to max length"""
-    if len(s) <= length:
-        return s
-    return s[:length-3] + "..."
-
 def get_redis_client(db: int = 0) -> redis.Redis:
     """Create Redis client connection"""
     return redis.Redis(
@@ -48,151 +42,79 @@ def get_hash_info(client: redis.Redis, key: str) -> Dict[str, Any]:
     """Get info about a Redis Hash"""
     try:
         size = client.hlen(key)
-
-        # Get one example
-        example = None
-        if size > 0:
-            # Get first key
-            keys = client.hkeys(key)
-            if keys:
-                first_key = keys[0]
-                value = client.hget(key, first_key)
-
-                # Try to parse as JSON
-                try:
-                    parsed_value = json.loads(value)
-                    example = {
-                        'key': first_key,
-                        'value': parsed_value
-                    }
-                except:
-                    example = {
-                        'key': first_key,
-                        'value': value
-                    }
-
         return {
             'exists': True,
             'type': 'Hash',
-            'size': size,
-            'example': example
+            'size': size
         }
     except Exception as e:
         return {
             'exists': False,
-            'error': str(e)
+            'error': str(e),
+            'type': 'Hash',
+            'size': 0
         }
 
 def get_stream_info(client: redis.Redis, key: str) -> Dict[str, Any]:
     """Get info about a Redis Stream"""
     try:
         info = client.xinfo_stream(key)
-
-        # Get one example message
-        example = None
-        if info['length'] > 0:
-            messages = client.xrange(key, count=1)
-            if messages:
-                msg_id, fields = messages[0]
-                example = {
-                    'message_id': msg_id,
-                    'fields': fields
-                }
-
-        # Get consumer group info
-        groups = []
+        
+        # Get consumer groups info
+        groups_count = 0
+        pending_total = 0
         try:
             groups_info = client.xinfo_groups(key)
+            groups_count = len(groups_info)
             for group in groups_info:
-                groups.append({
-                    'name': group['name'],
-                    'consumers': group['consumers'],
-                    'pending': group['pending']
-                })
+                pending_total += group['pending']
         except:
             pass
 
         return {
             'exists': True,
             'type': 'Stream',
-            'length': info['length'],
-            'groups': groups,
-            'example': example
+            'size': info['length'],
+            'groups': groups_count,
+            'pending': pending_total
         }
     except redis.exceptions.ResponseError:
         return {
             'exists': False,
-            'type': 'Stream'
+            'type': 'Stream',
+            'size': 0,
+            'groups': 0,
+            'pending': 0
         }
     except Exception as e:
         return {
             'exists': False,
-            'error': str(e)
+            'error': str(e),
+            'type': 'Stream',
+            'size': 0,
+            'groups': 0,
+            'pending': 0
         }
 
-def print_separator(char='=', length=80):
-    """Print separator line"""
-    print(char * length)
+def print_table_header():
+    """Print compressed table header"""
+    print(f"{'DATA STRUCTURE':<30} | {'TYPE':<10} | {'SIZE':>10} | {'GROUPS':>8} | {'PENDING':>8}")
+    print('-' * 80)
 
-def print_section_header(title: str):
-    """Print section header"""
-    print()
-    print_separator()
-    print(f"  {title}")
-    print_separator()
-
-def print_hash_details(name: str, info: Dict[str, Any]):
-    """Print details about a Hash"""
-    print(f"\n📦 {name}")
-
+def print_table_row(name: str, info: Dict[str, Any]):
+    """Print a compressed table row"""
+    status = "✅" if info['exists'] else "❌"
+    name_display = f"{status} {name}"
+    
     if not info['exists']:
-        print("   ❌ Does not exist")
-        if 'error' in info:
-            print(f"   Error: {info['error']}")
+        print(f"{name_display:<30} | {info.get('type', 'Unknown'):<10} | {'N/A':>10} | {'N/A':>8} | {'N/A':>8}")
         return
-
-    print(f"   Type: {info['type']}")
-    print(f"   Size: {format_size(info['size'])} keys")
-
-    if info['example']:
-        print(f"\n   Example Record:")
-        print(f"   Key: {truncate_string(info['example']['key'], 70)}")
-        print(f"   Value:")
-
-        if isinstance(info['example']['value'], dict):
-            for k, v in info['example']['value'].items():
-                if isinstance(v, (str, int, float)):
-                    print(f"      {k}: {truncate_string(str(v), 60)}")
-                else:
-                    print(f"      {k}: {type(v).__name__}")
-        else:
-            print(f"      {truncate_string(str(info['example']['value']), 70)}")
-
-def print_stream_details(name: str, info: Dict[str, Any]):
-    """Print details about a Stream"""
-    print(f"\n📡 {name}")
-
-    if not info['exists']:
-        print("   ❌ Does not exist")
-        if 'error' in info:
-            print(f"   Error: {info['error']}")
-        return
-
-    print(f"   Type: {info['type']}")
-    print(f"   Length: {format_size(info['length'])} messages")
-
-    if info.get('groups'):
-        print(f"\n   Consumer Groups:")
-        for group in info['groups']:
-            print(f"      • {group['name']}")
-            print(f"        Consumers: {group['consumers']}, Pending: {group['pending']}")
-
-    if info['example']:
-        print(f"\n   Example Message:")
-        print(f"   ID: {info['example']['message_id']}")
-        print(f"   Fields:")
-        for k, v in info['example']['fields'].items():
-            print(f"      {k}: {truncate_string(str(v), 60)}")
+    
+    size_str = format_size(info.get('size', 0))
+    groups_str = str(info.get('groups', 0)) if info.get('groups', 0) > 0 else "-"
+    pending_str = format_size(info.get('pending', 0)) if info.get('pending', 0) > 0 else "-"
+    
+    print(f"{name_display:<30} | {info.get('type', 'Unknown'):<10} | {size_str:>10} | {groups_str:>8} | {pending_str:>8}")
 
 def watch_site(site_name: str, refresh: Optional[int] = None):
     """Watch Redis data structures for a site"""
@@ -206,64 +128,60 @@ def watch_site(site_name: str, refresh: Optional[int] = None):
             if refresh:
                 clear_screen()
 
-            print_separator('=', 80)
-            print(f"  REDIS WATCHER - {site_name.upper()}")
-            print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print_separator('=', 80)
+            # Header
+            print('=' * 80)
+            print(f"REDIS WATCHER - {site_name.upper()}")
+            print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            if refresh:
+                print(f"Refresh: {refresh}s")
+            print('=' * 80)
 
-            print(f"\n🔗 Connected to: {REDIS_HOST}:{REDIS_PORT}")
-
-            # Scrape Session (Hash - DB 0)
-            print_section_header("SCRAPER DATA STRUCTURES (DB 0)")
-
+            # Scraper Data Structures (DB 0)
+            print(f"\n📊 SCRAPER DATA STRUCTURES (DB 0)")
+            print_table_header()
+            
             scrape_session = get_hash_info(client_db0, f"scrape_session_{site_name}")
-            print_hash_details(f"scrape_session_{site_name}", scrape_session)
-
-            # Processed URLs (Hash - DB 0)
-            print()
+            print_table_row(f"scrape_session_{site_name}", scrape_session)
+            
             processed_urls = get_hash_info(client_db0, f"processed_urls_{site_name}")
-            print_hash_details(f"processed_urls_{site_name}", processed_urls)
-
-            # URL Stream (Stream - DB 0)
-            print()
+            print_table_row(f"processed_urls_{site_name}", processed_urls)
+            
             url_stream = get_stream_info(client_db0, f"urls_stream_{site_name}")
-            print_stream_details(f"urls_stream_{site_name}", url_stream)
-
-            # Failed URLs (Hash - DB 0)
-            print()
+            print_table_row(f"urls_stream_{site_name}", url_stream)
+            
             failed_urls = get_hash_info(client_db0, f"failed_urls_{site_name}")
-            print_hash_details(f"failed_urls_{site_name}", failed_urls)
+            print_table_row(f"failed_urls_{site_name}", failed_urls)
 
-            # DB Sync (Hash - DB 1)
-            print_section_header("DATABASE SYNC (DB 1)")
-
+            # Database Sync (DB 1)
+            print(f"\n🔄 DATABASE SYNC (DB 1)")
+            print_table_header()
+            
             db_sync = get_hash_info(client_db1, f"db_sync_{site_name}")
-            print_hash_details(f"db_sync_{site_name}", db_sync)
+            print_table_row(f"db_sync_{site_name}", db_sync)
 
-            # Summary
-            print_section_header("SUMMARY")
-
-            total_urls = processed_urls.get('size', 0)
-            session_urls = scrape_session.get('size', 0)
-            stream_length = url_stream.get('length', 0)
+            # Quick Stats
+            print(f"\n📈 QUICK STATS")
+            print('-' * 40)
+            total_processed = processed_urls.get('size', 0)
+            current_session = scrape_session.get('size', 0)
+            stream_queue = url_stream.get('size', 0)
             failed_count = failed_urls.get('size', 0)
+            
+            print(f"Processed URLs:  {format_size(total_processed)}")
+            print(f"Active Session:  {format_size(current_session)}")
+            print(f"Stream Queue:    {format_size(stream_queue)}")
+            print(f"Failed URLs:     {format_size(failed_count)}")
+            
+            if total_processed > 0 and current_session > 0:
+                expired = total_processed - current_session
+                print(f"Expired URLs:    {format_size(expired)}")
 
-            print(f"\n   Total Processed:     {format_size(total_urls)}")
-            print(f"   Current Session:     {format_size(session_urls)}")
-            print(f"   Stream Queue:        {format_size(stream_length)}")
-            print(f"   Failed:              {format_size(failed_count)}")
-
-            if total_urls > 0 and session_urls > 0:
-                expired = total_urls - session_urls
-                print(f"   Potentially Expired: {format_size(expired)}")
-
-            print()
-            print_separator('=', 80)
+            print('=' * 80)
 
             if not refresh:
                 break
 
-            print(f"\n⏱️  Auto-refreshing every {refresh} seconds... (Ctrl+C to stop)")
+            print(f"\n⏱️  Refreshing in {refresh} seconds... (Ctrl+C to stop)")
             time.sleep(refresh)
 
     except KeyboardInterrupt:
