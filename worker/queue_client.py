@@ -317,37 +317,3 @@ def create_queue_manager(site_name: str) -> QueueManager:
         password='rabbitmqpass',
         queue_name=f'scraped_urls_{site_name}'  # Changed to match consumer convention
     )
-
-
-def test_connections(site_name: str = 'test'):
-    """Test RabbitMQ and Redis connections."""
-    print(f"\n=== Testing Connections for '{site_name}' ===\n")
-
-    # Test Redis
-    try:
-        redis_dedup = create_redis_deduplicator(site_name)
-        print(f"✅ Redis connected successfully")
-        print(f"   Set name: processed_urls_{site_name}")
-        print(f"   Current count: {redis_dedup.get_total_count()}")
-        redis_dedup.close()
-    except Exception as e:
-        print(f"❌ Redis connection failed: {e}")
-
-    # Test RabbitMQ
-    try:
-        queue_mgr = create_queue_manager(site_name)
-        queue_mgr.connect()
-        print(f"✅ RabbitMQ connected successfully")
-        print(f"   Queue name: scraped_urls_{site_name}")
-        print(f"   Current size: {queue_mgr.get_queue_size()}")
-        queue_mgr.close()
-    except Exception as e:
-        print(f"❌ RabbitMQ connection failed: {e}")
-
-    print(f"\n=== Test Complete ===\n")
-
-
-if __name__ == "__main__":
-    import sys
-    site_name = sys.argv[1] if len(sys.argv) > 1 else 'test'
-    test_connections(site_name)

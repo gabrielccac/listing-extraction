@@ -12,7 +12,7 @@ from seleniumbase import sb_cdp
 
 # Import from our modules
 from queue_client import create_queue_manager, create_redis_deduplicator
-from parser import parse_property_data  # NEW: Import parser
+from parser import parse_property_data
 
 # Import pika and redis for compatibility with existing code
 import pika
@@ -24,18 +24,10 @@ REDIS_PROCESSED_SET = f'processed_urls_{SITE_NAME}'
 
 # --- Configuration ---
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [Worker-%(thread)d] - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(threadName)s] - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
-
-# Silence noisy loggers
-logging.getLogger("seleniumbase").setLevel(logging.WARNING)
-logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
-logging.getLogger("selenium").setLevel(logging.WARNING)
-logging.getLogger("pika").setLevel(logging.WARNING)
+for l in ["seleniumbase", "selenium", "pika"]: logging.getLogger(l).setLevel(logging.WARNING)
 
 # Configuration
 MAX_RETRIES = 3
@@ -63,15 +55,62 @@ total_stats = {
     'rows_written': 0,
 }
 
+# NEW: Track all browser instances for force-close on shutdown
+active_browsers = []
+browsers_lock = threading.Lock()
+
 # Global flag for graceful shutdown
 shutdown_event = threading.Event()
+force_shutdown = False  # NEW: Track force shutdown (second Ctrl+C)
+
+# NEW: Function to force-close all browsers
+def close_all_browsers():
+    """Force-close all active browsers (called on shutdown)."""
+    with browsers_lock:
+        if not active_browsers:
+            return
+        
+        logger.info(f"[SHUTDOWN] Force-closing {len(active_browsers)} browser(s)...")
+        
+        for browser in active_browsers:
+            try:
+                browser.driver.stop()
+            except Exception as e:
+                logger.debug(f"Error force-closing browser: {e}")
+        
+        active_browsers.clear()
+        logger.info("[SHUTDOWN] All browsers closed")
 
 # Signal handler for Ctrl+C
 def signal_handler(sig, frame):
-    logger.info("🚨 Ctrl+C detected! Initiating graceful shutdown...")
+    """Handle Ctrl+C gracefully."""
+    global force_shutdown
+    
+    if shutdown_event.is_set():
+        # Second Ctrl+C - force shutdown
+        logger.warning("\n[FORCE SHUTDOWN] Second Ctrl+C detected!")
+        logger.warning("[FORCE SHUTDOWN] Closing all browsers and exiting immediately...")
+        force_shutdown = True
+        close_all_browsers()
+        sys.exit(1)
+    
+    # First Ctrl+C - graceful shutdown
     shutdown_event.set()
+    logger.info("\n[SHUTDOWN] Ctrl+C detected! Initiating graceful shutdown...")
+    logger.info("[SHUTDOWN] Workers will finish current URL and exit")
+    logger.info("[SHUTDOWN] Press Ctrl+C again to force quit immediately")
+    
+    # Close browsers after a timeout if workers don't finish
+    def delayed_browser_close():
+        time.sleep(10)  # Wait 10 seconds for graceful shutdown
+        if not force_shutdown:
+            logger.warning("[SHUTDOWN] Timeout reached - force-closing browsers")
+            close_all_browsers()
+    
+    threading.Thread(target=delayed_browser_close, daemon=True).start()
 
 signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # --- CSV Output ---
 def save_to_csv(property_data):
@@ -138,47 +177,50 @@ def is_captcha_page(sb):
         for indicator in captcha_indicators:
             if indicator in page_source:
                 return True
-        if sb.is_element_visible('p#Truv1'):
-            return True
     except Exception as e:
         logger.debug(f"Error checking for captcha: {e}")
     return False
 
-def handle_captcha(sb, max_attempts=3):
-    """Handle captcha if detected"""
-    for attempt in range(max_attempts):
-        if shutdown_event.is_set():
-            logger.info("Shutdown requested, stopping captcha handling")
-            return False
-        logger.info(f"🤖 Captcha detected! Solving attempt {attempt + 1}/{max_attempts}...")
+def handle_captcha(self, max_wait: int = 30) -> bool:
+    """
+    Wait for SeleniumBase UC mode to solve captcha.
+    
+    Args:
+        max_wait: Maximum time to wait (seconds)
+        
+    Returns:
+        True if captcha cleared
+    """
+    logger.warning("⚠️  Captcha detected! Waiting for UC mode to handle it...")
+    
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        # Check if title changed (captcha cleared)
         try:
-            sb.sleep(3)
-            if not is_captcha_page(sb):
-                logger.info("✓ Captcha solved successfully!")
-                with results_lock:
-                    total_stats['captchas_solved'] += 1
+            title = self.sb.get_title()
+            if "Um momento" not in title:
+                logger.info("✅ Captcha cleared successfully")
                 return True
-            logger.warning(f"Captcha still present after attempt {attempt + 1}")
-            sb.sleep(2)
-        except Exception as e:
-            logger.error(f"Error solving captcha: {str(e)[:100]}")
-    logger.error("✗ Failed to solve captcha after all attempts")
+        except:
+            pass
+        
+        time.sleep(1)
+    
+    logger.error("🚫 Captcha not cleared within timeout")
     return False
 
-# --- Listing Status Check Function ---
 def is_listing_active(soup, url):
-    """Check if the listing is still active/available."""
+    """Check if the listing is active by confirming the main container exists."""
     try:
-        offline_div = soup.find('div', class_='section-offline-disclaimer')
-        if offline_div:
-            offline_text = offline_div.find('p')
-            if offline_text and "Este anúncio não está mais publicado" in offline_text.get_text():
-                logger.warning(f"Listing is offline: {url}")
-                return False
-        return True
+        active_container = soup.find('main', class_='bg-ficha')
+        if active_container:
+            return True
+        else:
+            logger.warning(f"No active listing container found: {url}")
+            return False
     except Exception as e:
         logger.error(f"Error checking listing status for {url}: {e}")
-        return True
+        return False
 
 # --- Worker Function ---
 def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_client, queue_name):
@@ -194,6 +236,11 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
 
     try:
         sb = sb_cdp.Chrome(uc=True, uc_cdp_events=True, locale="pt-br")
+        
+        # NEW: Register browser for tracking
+        with browsers_lock:
+            active_browsers.append(sb)
+        
         logger.info(f"[{thread_name}] ✅ Browser initialized")
 
         while not shutdown_event.is_set():
@@ -204,6 +251,11 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
             # Get next URL directly from RabbitMQ using the lock
             try:
                 with mq_lock:
+                    # Check shutdown before attempting RMQ operation
+                    if shutdown_event.is_set():
+                        logger.info(f"[{thread_name}] 🛑 Shutdown detected, exiting")
+                        break
+                    
                     method_frame, header_frame, body = mq_channel.basic_get(
                         queue=queue_name, auto_ack=False
                     )
@@ -216,6 +268,9 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                     break
             
             except Exception as e:
+                if shutdown_event.is_set():
+                    logger.debug(f"[{thread_name}] Expected error during shutdown: {e}")
+                    break
                 logger.error(f"[{thread_name}] ❌ Error fetching from RabbitMQ: {e}")
                 time.sleep(5)
                 continue
@@ -229,8 +284,19 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                 logger.info(f"[{thread_name}] ⏭️  Skipping already processed URL: {url}")
                 if delivery_tag:
                     with mq_lock:
-                        mq_channel.basic_ack(delivery_tag=delivery_tag)
+                        if not shutdown_event.is_set():
+                            mq_channel.basic_ack(delivery_tag=delivery_tag)
                 continue
+
+            # Check shutdown before processing
+            if shutdown_event.is_set():
+                logger.info(f"[{thread_name}] 🛑 Shutdown → requeuing {url[:80]}")
+                with mq_lock:
+                    try:
+                        mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                    except:
+                        pass
+                break
 
             # Process this URL
             logger.info(f"[{thread_name}] Processing: {url} (Retry {retry_count})")
@@ -238,6 +304,16 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
 
             try:
                 sb.open(url)
+
+                # Check shutdown after navigation
+                if shutdown_event.is_set():
+                    logger.info(f"[{thread_name}] 🛑 Shutdown during navigation")
+                    with mq_lock:
+                        try:
+                            mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                        except:
+                            pass
+                    break
 
                 if is_captcha_page(sb):
                     if not handle_captcha(sb):
@@ -248,12 +324,17 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                         # Restart browser after captcha failure
                         try:
                             sb.driver.stop()
+                            with browsers_lock:
+                                if sb in active_browsers:
+                                    active_browsers.remove(sb)
                         except:
                             pass
 
                         try:
                             logger.info(f"[{thread_name}] 🔄 Restarting browser after captcha failure...")
                             sb = sb_cdp.Chrome(uc=True, uc_cdp_events=True, locale="pt-br")
+                            with browsers_lock:
+                                active_browsers.append(sb)
                             with results_lock:
                                 total_stats['browser_restarts'] += 1
                             logger.info(f"[{thread_name}] ✅ Browser restarted successfully")
@@ -269,14 +350,14 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                 if not is_listing_active(soup, url):
                     logger.warning(f"[{thread_name}] 🛑 Listing is OFFLINE, skipping: {url}")
                     with mq_lock:
-                        mq_channel.basic_ack(delivery_tag=delivery_tag)
+                        if not shutdown_event.is_set():
+                            mq_channel.basic_ack(delivery_tag=delivery_tag)
                     redis_client.srem(REDIS_PROCESSED_SET, url)
                     logger.debug(f"[{thread_name}] Removed offline URL from Redis: {url}")
                     with results_lock:
                         total_stats['offline'] += 1
                     continue
 
-                # NEW: Use parser module instead of inline extraction
                 property_data = parse_property_data(soup, url, html)
 
                 if not property_data or not property_data.get("titulo"):
@@ -301,7 +382,8 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                 
                 if delivery_tag:
                     with mq_lock:
-                        mq_channel.basic_ack(delivery_tag=delivery_tag)
+                        if not shutdown_event.is_set():
+                            mq_channel.basic_ack(delivery_tag=delivery_tag)
                 redis_client.sadd(REDIS_PROCESSED_SET, url)
                 
                 urls_processed += 1
@@ -309,14 +391,19 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
             except Exception as e:
                 logger.error(f"[{thread_name}] ❌ Error processing {url}: {str(e)[:200]}")
 
-                try: 
+                try:
                     sb.driver.stop()
-                except: 
+                    with browsers_lock:
+                        if sb in active_browsers:
+                            active_browsers.remove(sb)
+                except:
                     pass
 
                 try:
                     logger.info(f"[{thread_name}] 🔄 Restarting browser...")
                     sb = sb_cdp.Chrome(uc=True, uc_cdp_events=True, locale="pt-br")
+                    with browsers_lock:
+                        active_browsers.append(sb)
                     with results_lock:
                         total_stats['browser_restarts'] += 1
                     logger.info(f"[{thread_name}] ✅ Browser restarted successfully")
@@ -331,16 +418,27 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                                   mq_channel, mq_lock, delivery_tag, queue_name)
 
     finally:
+        # Clean up browser
         if sb:
             try:
                 logger.info(f"[{thread_name}] 🧹 Closing browser (processed {urls_processed} URLs)")
                 sb.driver.stop()
+                
+                # Remove from tracking
+                with browsers_lock:
+                    if sb in active_browsers:
+                        active_browsers.remove(sb)
+                        
             except Exception as e:
                 logger.debug(f"[{thread_name}] Error closing browser: {e}")
+        
         logger.info(f"[{thread_name}] 👋 Worker exiting")
 
 def handle_failed_url(url, error_msg, url_retry_counts, mq_channel, mq_lock, delivery_tag, queue_name):
     """Handle a failed URL with retry logic"""
+    if shutdown_event.is_set():
+        return  # Don't retry during shutdown
+    
     with results_lock:
         total_stats['errors'] += 1
         retry_count = url_retry_counts.get(url, 0)
@@ -349,22 +447,31 @@ def handle_failed_url(url, error_msg, url_retry_counts, mq_channel, mq_lock, del
             url_retry_counts[url] = retry_count + 1
 
             with mq_lock:
-                if delivery_tag:
-                    mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
+                if shutdown_event.is_set():
+                    return
                 
-                mq_channel.basic_publish(
-                    exchange='',
-                    routing_key=queue_name,
-                    body=url.encode('utf-8'),
-                    properties=pika.BasicProperties(delivery_mode=2)
-                )
-            
-            logger.info(f"🔄 Re-queued {url} to RabbitMQ (Retry {retry_count + 1}/{MAX_RETRIES})")
+                try:
+                    if delivery_tag:
+                        mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
+                    
+                    mq_channel.basic_publish(
+                        exchange='',
+                        routing_key=queue_name,
+                        body=url.encode('utf-8'),
+                        properties=pika.BasicProperties(delivery_mode=2)
+                    )
+                    logger.info(f"🔄 Re-queued {url} to RabbitMQ (Retry {retry_count + 1}/{MAX_RETRIES})")
+                except Exception as e:
+                    logger.debug(f"Error requeuing: {e}")
         else:
             logger.error(f"🚫 Max retries reached for {url}, discarding.")
             if delivery_tag:
                 with mq_lock:
-                    mq_channel.basic_ack(delivery_tag=delivery_tag)
+                    try:
+                        if not shutdown_event.is_set():
+                            mq_channel.basic_ack(delivery_tag=delivery_tag)
+                    except:
+                        pass
 
 # --- Main Thread ---
 
@@ -405,30 +512,51 @@ if __name__ == "__main__":
     logger.info(f"Output file: {CSV_OUTPUT_FILE}")
     logger.info("=" * 60)
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for worker_id in range(MAX_WORKERS):
-            future = executor.submit(
-                persistent_worker,
-                worker_id,
-                url_retry_counts,
-                mq_channel,
-                mq_lock,
-                redis_client,
-                queue_name
-            )
-            futures.append(future)
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = []
+            for worker_id in range(MAX_WORKERS):
+                future = executor.submit(
+                    persistent_worker,
+                    worker_id,
+                    url_retry_counts,
+                    mq_channel,
+                    mq_lock,
+                    redis_client,
+                    queue_name
+                )
+                futures.append(future)
 
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Worker failed with exception: {e}")
+            # Wait for workers with timeout check
+            for future in futures:
+                try:
+                    # Wait with timeout to allow checking shutdown
+                    while not future.done():
+                        if shutdown_event.is_set():
+                            break
+                        time.sleep(0.5)
+                    
+                    if not shutdown_event.is_set():
+                        future.result(timeout=1)
+                        
+                except Exception as e:
+                    if not shutdown_event.is_set():
+                        logger.error(f"Worker failed with exception: {e}")
+    
+    except KeyboardInterrupt:
+        pass  # Already handled by signal handler
+    
+    finally:
+        # Ensure all browsers are closed
+        close_all_browsers()
 
     elapsed = time.time() - start_time
 
-    mq_connection.close()
-    logger.info("✅ RabbitMQ connection closed")
+    try:
+        mq_connection.close()
+        logger.info("✅ RabbitMQ connection closed")
+    except Exception as e:
+        logger.debug(f"Error closing RabbitMQ: {e}")
 
     logger.info("=" * 60)
     logger.info("PROCESSING COMPLETE" if not shutdown_event.is_set() else "PROCESSING STOPPED")
