@@ -466,77 +466,88 @@ class ImovelwebScraper:
     
     def store_urls_batch(self, url_price_pairs: list, metadata: dict) -> dict:
         """
-        FAST VERSION: Batch Redis operations
+        OPTIMIZED: True batch Redis operations with HMGET, pipeline, and HSET mapping
         """
         if not url_price_pairs:
             return {'new': 0, 'price_changes': 0, 'duplicates': 0}
-        
+
+        # Convert None prices to 0 (Redis doesn't accept None values)
+        normalized_pairs = []
+        none_count = 0
+        for url, price in url_price_pairs:
+            if price is None:
+                normalized_pairs.append((url, 0))
+                none_count += 1
+            else:
+                normalized_pairs.append((url, price))
+
+        if none_count > 0:
+            logger.debug(f"⚠️ {none_count} URLs had no price, storing as 0")
+
         stats = {'new': 0, 'price_changes': 0, 'duplicates': 0}
         urls_to_publish = []
         scrape_session_updates = {}
         processed_updates = {}
-        
-        # Batch get existing data
-        urls = [url for url, _ in url_price_pairs]
-        existing_data = {}
-        for url in urls:
-            historical_data = self.processed_urls.get_url_data(url)
-            if historical_data:
-                existing_data[url] = historical_data
-        
+
+        # ✅ BATCH 1: Get all existing data in single HMGET operation
+        urls = [url for url, _ in normalized_pairs]
+        existing_data = self.processed_urls.get_urls_batch(urls)
+
         # Process in batch
-        for url, current_price in url_price_pairs:
-            # Always update scrape_session
+        for url, current_price in normalized_pairs:
+            # Always update scrape_session (for expired detection)
             scrape_session_updates[url] = current_price
-            
+
             historical_data = existing_data.get(url)
-            
+
             if historical_data:
+                # URL exists in processed_urls
                 historical_price = historical_data.get('price')
-                
+
                 if historical_price == current_price:
+                    # DUPLICATE: same price, no changes needed
                     stats['duplicates'] += 1
-                    continue
+                    continue  # Skip: no stream publish, no processed_urls update
                 else:
+                    # PRICE CHANGE: update price in processed_urls, but don't publish to stream
+                    # (worker already scraped full details, we just need to update the price)
                     stats['price_changes'] += 1
-                    urls_to_publish.append(url)
+                    # Note: urls_to_publish NOT added - price changes don't need worker processing
             else:
+                # NEW URL: publish to stream for worker to scrape full details
                 stats['new'] += 1
-                urls_to_publish.append(url)
-            
-            # Prepare processed_urls update
+                urls_to_publish.append((url, 'new'))
+
+            # Prepare processed_urls update (for NEW and PRICE_CHANGE, not duplicates)
             processed_updates[url] = {
                 'price': current_price,
                 'last_seen': time.time(),
                 'first_seen': historical_data.get('first_seen', time.time()) if historical_data else time.time(),
                 **metadata
             }
-        
-        # BATCH OPERATIONS (FAST!)
-        # 1. Update scrape_session in batch
+
+        # ✅ BATCH 2: Update scrape_session in single HSET operation
         if scrape_session_updates:
             self.scrape_session.client.hset(
-                self.scrape_session.scrape_session_key, 
+                self.scrape_session.scrape_session_key,
                 mapping=scrape_session_updates
             )
-        
-        # 2. Publish to stream in batch  
-        for url in urls_to_publish:
-            action = 'price_update' if url in existing_data else 'new'
-            self.url_stream.publish_url(url, action)
-        
-        # 3. Update processed_urls in batch
+
+        # ✅ BATCH 3: Publish to stream using pipeline (single round-trip)
+        if urls_to_publish:
+            self.url_stream.publish_urls_batch(urls_to_publish)
+
+        # ✅ BATCH 4: Update processed_urls in single HSET operation with mapping
         if processed_updates:
-            for url, data in processed_updates.items():
-                self.processed_urls.client.hset(
-                    self.processed_urls.processed_key,
-                    url,
-                    json.dumps(data)
-                )
-        
-        logger.info(f"📊 Batch: {len(url_price_pairs)} URLs → "
+            serialized_updates = {url: json.dumps(data) for url, data in processed_updates.items()}
+            self.processed_urls.client.hset(
+                self.processed_urls.processed_key,
+                mapping=serialized_updates
+            )
+
+        logger.info(f"📊 Batch: {len(normalized_pairs)} URLs → "
                 f"🆕{stats['new']} 💰{stats['price_changes']} 🔄{stats['duplicates']}")
-        
+
         return stats
     
     # ========================================================================

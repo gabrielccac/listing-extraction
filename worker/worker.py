@@ -4,21 +4,22 @@ import threading
 import os
 import sys
 import signal
-import csv
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from seleniumbase import sb_cdp
 
-# Import from our modules
-from queue_client import create_queue_manager, create_redis_deduplicator
-from parser import parse_property_data
+# Add parent directory to path to import from provider
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-# Import pika and redis for compatibility with existing code
-import pika
+# Import from our modules
+from provider.redis_client import create_redis_clients
+from parser import parse_property_data
 
 # Site-specific configuration
 SITE_NAME = 'imovelweb'
-REDIS_PROCESSED_SET = f'processed_urls_{SITE_NAME}'
+REDIS_HOST = '5.161.248.214'
+REDIS_PORT = 6379
+REDIS_PASSWORD = 'redispass'
 
 # --- Configuration ---
 
@@ -31,26 +32,23 @@ for l in ["seleniumbase", "selenium", "pika"]: logging.getLogger(l).setLevel(log
 MAX_RETRIES = 3
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '3'))
 
-# CSV Output file - unique per consumer instance
-CONSUMER_ID = os.getpid()
-OUTPUT_DIR = os.getenv('OUTPUT_DIR', '.')
-CSV_OUTPUT_FILE = os.path.join(OUTPUT_DIR, f'imovelweb_listings_{CONSUMER_ID}.csv')
+# Worker ID
+WORKER_ID = os.getpid()
 FAILED_DIR = "failed_urls"
 
 # Ensure directories exist
 os.makedirs(FAILED_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Thread-safe storage & stats
 results_lock = threading.Lock()
-mq_lock = threading.Lock()
 total_stats = {
     'success': 0,
     'errors': 0,
+    'retries': 0,
+    'failed_permanent': 0,
     'captchas_solved': 0,
     'browser_restarts': 0,
     'offline': 0,
-    'rows_written': 0,
 }
 
 # NEW: Track all browser instances for force-close on shutdown
@@ -109,55 +107,6 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
-
-# --- CSV Output ---
-def save_to_csv(property_data):
-    """Save property data to CSV file."""
-    file_exists = os.path.isfile(CSV_OUTPUT_FILE)
-
-    fieldnames = [
-        "url_imovel", "_source", "short_id", "tipo_imovel", "enquadramento", "purpose_type",
-        "stage_description", "titulo", "descricao", "endereco", "bairro", "cidade",
-        "anunciante", "anunciante_id", "anunciante_creci", "responsavel", "tipo_responsavel",
-        "contato_responsavel", "contatos_adicionais", "picture_link", "carousel_img_links",
-        "metragem", "quartos", "suites", "banheiro", "vagas", "valor", "condominio", "iptu",
-        "preco_m2", "aceita_permuta", "aceita_fgts", "aceita_financiamento", "mobiliado",
-        "piso", "posicao_solar", "andar", "elevador", "tipo_cozinha", "vazado", "dce",
-        "reformado", "vista_livre", "varanda", "gas_encanado", "reforma_hidraulica",
-        "reforma_eletrica", "fachada_reformada", "lazer_completo", "lazer_parcial",
-        "sala_ginastica", "salao_de_festas", "salao_de_jogos", "sauna", "piscina",
-        "piscina_aquecida", "quadra_esportiva", "churrasqueira", "cinema", "lavanderia",
-        "playground", "pista_skate", "features", "dt_atualizacao", "anuncio_id"
-    ]
-
-    try:
-        with results_lock:
-            with open(CSV_OUTPUT_FILE, 'a', newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-                if not file_exists:
-                    writer.writeheader()
-
-                row = {field: property_data.get(field, "") for field in fieldnames}
-
-                # Convert lists to strings for CSV
-                if row.get("contatos_adicionais") and isinstance(row["contatos_adicionais"], list):
-                    row["contatos_adicionais"] = ", ".join(row["contatos_adicionais"])
-                
-                if row.get("carousel_img_links") and isinstance(row["carousel_img_links"], list):
-                    row["carousel_img_links"] = ", ".join(row["carousel_img_links"])
-                
-                if row.get("features") and isinstance(row["features"], list):
-                    row["features"] = ", ".join(row["features"])
-
-                writer.writerow(row)
-
-        total_stats['rows_written'] += 1
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error saving to CSV: {e}")
-        return False
 
 # --- Captcha Handling Functions ---
 def is_captcha_page(sb):
@@ -221,74 +170,76 @@ def is_listing_active(soup, url):
         return False
 
 # --- Worker Function ---
-def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_client, queue_name):
+def persistent_worker(worker_id, redis_clients):
     """
     Worker that maintains ONE browser session.
-    Pulls URLs directly from RabbitMQ and processes them.
+    Pulls URLs from Redis Stream and processes them.
     """
     thread_name = f"Worker-{worker_id}"
-    logger.info(f"[{thread_name}] 🚀 Starting persistent worker")
+    consumer_name = f"worker-{WORKER_ID}-{worker_id}"
+    logger.info(f"[{thread_name}] 🚀 Starting persistent worker (consumer: {consumer_name})")
 
     sb = None
     urls_processed = 0
 
+    # Unpack Redis clients
+    url_stream = redis_clients['url_stream']
+    processed_urls = redis_clients['processed_urls']
+    failed_urls = redis_clients['failed_urls']
+
     try:
         sb = sb_cdp.Chrome(uc=True, uc_cdp_events=True, locale="pt-br")
-        
-        # NEW: Register browser for tracking
+
+        # Register browser for tracking
         with browsers_lock:
             active_browsers.append(sb)
-        
+
         logger.info(f"[{thread_name}] ✅ Browser initialized")
 
         while not shutdown_event.is_set():
             url = None
+            message_id = None
             retry_count = 0
-            delivery_tag = None
+            action = None
 
-            # Get next URL directly from RabbitMQ using the lock
+            # Get next URL from Redis Stream
             try:
-                with mq_lock:
-                    # Check shutdown before attempting RMQ operation
-                    if shutdown_event.is_set():
-                        logger.info(f"[{thread_name}] 🛑 Shutdown detected, exiting")
-                        break
-                    
-                    method_frame, header_frame, body = mq_channel.basic_get(
-                        queue=queue_name, auto_ack=False
-                    )
-                
-                if method_frame:
-                    url = body.decode('utf-8')
-                    delivery_tag = method_frame.delivery_tag
-                else:
-                    logger.info(f"[{thread_name}] 📭 Fila vazia. Encerrando worker.")
+                # Check shutdown before consuming
+                if shutdown_event.is_set():
+                    logger.info(f"[{thread_name}] 🛑 Shutdown detected, exiting")
                     break
-            
+
+                # Consume from stream (blocking with timeout)
+                messages = url_stream.consume_urls(
+                    consumer_name=consumer_name,
+                    count=1,
+                    block_ms=5000  # 5 second timeout
+                )
+
+                if not messages:
+                    # No messages available, check again
+                    continue
+
+                # Unpack message
+                message_id, url, fields = messages[0]
+                action = fields.get('action', 'new')
+                retry_count = int(fields.get('retry_count', 0))
+
             except Exception as e:
                 if shutdown_event.is_set():
                     logger.debug(f"[{thread_name}] Expected error during shutdown: {e}")
                     break
-                logger.error(f"[{thread_name}] ❌ Error fetching from RabbitMQ: {e}")
+                logger.error(f"[{thread_name}] ❌ Error consuming from stream: {e}")
                 time.sleep(5)
                 continue
 
-            # Get retry count
-            with results_lock:
-                retry_count = url_retry_counts.get(url, 0)
-
             # Check shutdown before processing
             if shutdown_event.is_set():
-                logger.info(f"[{thread_name}] 🛑 Shutdown → requeuing {url[:80]}")
-                with mq_lock:
-                    try:
-                        mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
-                    except:
-                        pass
+                logger.info(f"[{thread_name}] 🛑 Shutdown detected, message stays in stream")
                 break
 
             # Process this URL
-            logger.info(f"[{thread_name}] Processing: {url} (Retry {retry_count})")
+            logger.info(f"[{thread_name}] Processing: {url} (Action: {action}, Retry: {retry_count})")
             url_start_time = time.time()
 
             try:
@@ -296,19 +247,18 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
 
                 # Check shutdown after navigation
                 if shutdown_event.is_set():
-                    logger.info(f"[{thread_name}] 🛑 Shutdown during navigation")
-                    with mq_lock:
-                        try:
-                            mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
-                        except:
-                            pass
+                    logger.info(f"[{thread_name}] 🛑 Shutdown during navigation, message stays in stream")
                     break
 
+                # Handle captcha
                 if is_captcha_page(sb):
                     if not handle_captcha(sb):
-                        logger.error(f"[{thread_name}] Failed to solve captcha for {url}")
-                        handle_failed_url(url, "Captcha resolution failed",
-                                          url_retry_counts, mq_channel, mq_lock, delivery_tag, queue_name)
+                        error_msg = "Captcha resolution failed"
+                        logger.error(f"[{thread_name}] {error_msg} for {url}")
+
+                        # ACK and retry or fail
+                        url_stream.ack_message(message_id)
+                        handle_retry_or_fail(url, error_msg, retry_count, url_stream, failed_urls)
 
                         # Restart browser after captcha failure
                         try:
@@ -336,50 +286,63 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                 html = sb.get_page_source()
                 soup = BeautifulSoup(html, 'lxml')
 
+                # Check if listing is offline
                 if not is_listing_active(soup, url):
-                    logger.warning(f"[{thread_name}] 🛑 Listing is OFFLINE, skipping: {url}")
-                    with mq_lock:
-                        if not shutdown_event.is_set():
-                            mq_channel.basic_ack(delivery_tag=delivery_tag)
-                    redis_client.srem(REDIS_PROCESSED_SET, url)
-                    logger.debug(f"[{thread_name}] Removed offline URL from Redis: {url}")
+                    logger.warning(f"[{thread_name}] 🛑 Listing is OFFLINE, removing: {url}")
+                    url_stream.ack_message(message_id)  # ACK to remove from stream
+                    processed_urls.remove_url(url)  # Remove from processed_urls
                     with results_lock:
                         total_stats['offline'] += 1
                     continue
 
+                # Parse property data
                 property_data = parse_property_data(soup, url, html)
 
                 if not property_data or not property_data.get("titulo"):
-                    logger.warning(f"[{thread_name}] No valid data found for {url}")
+                    error_msg = "No valid data extracted"
+                    logger.warning(f"[{thread_name}] {error_msg} for {url}")
                     sb.save_screenshot(os.path.join(FAILED_DIR, f"no_data_{time.time_ns()}.png"))
-                    handle_failed_url(url, "No valid data extracted",
-                                      url_retry_counts, mq_channel, mq_lock, delivery_tag, queue_name)
+
+                    # ACK and retry or fail
+                    url_stream.ack_message(message_id)
+                    handle_retry_or_fail(url, error_msg, retry_count, url_stream, failed_urls)
                     continue
 
-                if not save_to_csv(property_data):
-                    logger.error(f"[{thread_name}] Failed to save to CSV for {url}")
-                    handle_failed_url(url, "CSV save failed",
-                                      url_retry_counts, mq_channel, mq_lock, delivery_tag, queue_name)
+                # Save to Redis processed_urls Hash
+                try:
+                    processed_urls.update_full_data(url, property_data)
+                except Exception as e:
+                    error_msg = f"Redis save failed: {str(e)[:100]}"
+                    logger.error(f"[{thread_name}] {error_msg}")
+
+                    # ACK and retry or fail
+                    url_stream.ack_message(message_id)
+                    handle_retry_or_fail(url, error_msg, retry_count, url_stream, failed_urls)
                     continue
 
                 # Success!
                 url_elapsed = time.time() - url_start_time
                 logger.info(f"[{thread_name}] ✅ Success for {url} in {url_elapsed:.2f}s")
-                
+
                 with results_lock:
                     total_stats['success'] += 1
-                
-                if delivery_tag:
-                    with mq_lock:
-                        if not shutdown_event.is_set():
-                            mq_channel.basic_ack(delivery_tag=delivery_tag)
-                redis_client.sadd(REDIS_PROCESSED_SET, url)
-                
+
+                # ACK message
+                url_stream.ack_message(message_id)
+
                 urls_processed += 1
 
             except Exception as e:
-                logger.error(f"[{thread_name}] ❌ Error processing {url}: {str(e)[:200]}")
+                error_msg = f"Exception: {str(e)[:200]}"
+                logger.error(f"[{thread_name}] ❌ Error processing {url}: {error_msg}")
 
+                # ACK and retry or fail
+                if message_id:
+                    url_stream.ack_message(message_id)
+                if url:
+                    handle_retry_or_fail(url, error_msg, retry_count, url_stream, failed_urls)
+
+                # Restart browser after error
                 try:
                     sb.driver.stop()
                     with browsers_lock:
@@ -398,13 +361,7 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
                     logger.info(f"[{thread_name}] ✅ Browser restarted successfully")
                 except Exception as restart_error:
                     logger.error(f"[{thread_name}] 🚨 Failed to restart browser: {restart_error}")
-                    if url and delivery_tag:
-                        handle_failed_url(url, str(e), url_retry_counts,
-                                          mq_channel, mq_lock, delivery_tag, queue_name)
-                    break 
-
-                handle_failed_url(url, str(e), url_retry_counts,
-                                  mq_channel, mq_lock, delivery_tag, queue_name)
+                    break
 
     finally:
         # Clean up browser
@@ -423,84 +380,68 @@ def persistent_worker(worker_id, url_retry_counts, mq_channel, mq_lock, redis_cl
         
         logger.info(f"[{thread_name}] 👋 Worker exiting")
 
-def handle_failed_url(url, error_msg, url_retry_counts, mq_channel, mq_lock, delivery_tag, queue_name):
-    """Handle a failed URL with retry logic"""
+def handle_retry_or_fail(url, error_msg, retry_count, url_stream, failed_urls):
+    """Handle a failed URL with retry logic (max 3 retries)"""
     if shutdown_event.is_set():
         return  # Don't retry during shutdown
-    
+
     with results_lock:
         total_stats['errors'] += 1
-        retry_count = url_retry_counts.get(url, 0)
 
         if retry_count < MAX_RETRIES:
-            url_retry_counts[url] = retry_count + 1
-
-            with mq_lock:
-                if shutdown_event.is_set():
-                    return
-                
-                try:
-                    if delivery_tag:
-                        mq_channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
-                    
-                    mq_channel.basic_publish(
-                        exchange='',
-                        routing_key=queue_name,
-                        body=url.encode('utf-8'),
-                        properties=pika.BasicProperties(delivery_mode=2)
-                    )
-                    logger.info(f"🔄 Re-queued {url} to RabbitMQ (Retry {retry_count + 1}/{MAX_RETRIES})")
-                except Exception as e:
-                    logger.debug(f"Error requeuing: {e}")
+            # Retry: re-publish to stream with incremented retry count
+            try:
+                url_stream.client.xadd(
+                    url_stream.stream_key,
+                    {
+                        'url': url,
+                        'action': 'retry',
+                        'retry_count': str(retry_count + 1),
+                        'timestamp': str(time.time())
+                    }
+                )
+                total_stats['retries'] += 1
+                logger.info(f"🔄 Retry {retry_count + 1}/{MAX_RETRIES} for {url}: {error_msg}")
+            except Exception as e:
+                logger.error(f"Error re-publishing to stream: {e}")
         else:
-            logger.error(f"🚫 Max retries reached for {url}, discarding.")
-            if delivery_tag:
-                with mq_lock:
-                    try:
-                        if not shutdown_event.is_set():
-                            mq_channel.basic_ack(delivery_tag=delivery_tag)
-                    except:
-                        pass
+            # Failed permanently: store in failed_urls
+            try:
+                failed_urls.add_failed_url(url, error_msg)
+                total_stats['failed_permanent'] += 1
+                logger.error(f"🚫 Max retries reached for {url}, stored in failed_urls")
+            except Exception as e:
+                logger.error(f"Error storing failed URL: {e}")
 
 # --- Main Thread ---
 
 if __name__ == "__main__":
     start_time = time.time()
 
-    logger.info("Connecting to RabbitMQ and Redis...")
+    logger.info("Connecting to Redis...")
 
     try:
-        queue_mgr = create_queue_manager(SITE_NAME)
-        queue_mgr.connect()
-        mq_connection = queue_mgr.connection
-        mq_channel = queue_mgr.channel
-        logger.info("✅ Connected to RabbitMQ")
-    except Exception as e:
-        logger.error(f"❌ Failed to connect to RabbitMQ: {e}")
-        logger.error("Cannot proceed without RabbitMQ. Exiting.")
-        exit(1)
-
-    try:
-        redis_dedup = create_redis_deduplicator(SITE_NAME)
-        redis_client = redis_dedup.client
+        redis_clients = create_redis_clients(
+            site_name=SITE_NAME,
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            password=REDIS_PASSWORD
+        )
         logger.info("✅ Connected to Redis")
-        logger.info(f"   Processed URLs in Redis: {redis_dedup.get_total_count()}")
+        logger.info(f"   Stream: {redis_clients['url_stream'].stream_key}")
+        logger.info(f"   Consumer Group: {redis_clients['url_stream'].consumer_group}")
+        logger.info(f"   Processed URLs: {len(redis_clients['processed_urls'].get_all_urls()):,}")
+        logger.info(f"   Failed URLs: {redis_clients['failed_urls'].get_failed_count()}")
     except Exception as e:
         logger.error(f"❌ Failed to connect to Redis: {e}")
         logger.error("Cannot proceed without Redis. Exiting.")
-        mq_connection.close()
         exit(1)
 
-    url_retry_counts = {}
-    queue_name = queue_mgr.queue_name
+    logger.info("=" * 60)
+    logger.info(f"Starting ImovelWeb Redis Stream Processor")
+    logger.info(f"Worker ID: {WORKER_ID} | Max Workers: {MAX_WORKERS}")
+    logger.info("=" * 60)
 
-    logger.info("=" * 60)
-    logger.info(f"Starting ImovelWeb Persistent Session Processor")
-    logger.info(f"Consumer ID: {CONSUMER_ID} | Max Workers: {MAX_WORKERS}")
-    logger.info(f"Queue: {queue_name}")
-    logger.info(f"Output file: {CSV_OUTPUT_FILE}")
-    logger.info("=" * 60)
-    
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
@@ -508,11 +449,7 @@ if __name__ == "__main__":
                 future = executor.submit(
                     persistent_worker,
                     worker_id,
-                    url_retry_counts,
-                    mq_channel,
-                    mq_lock,
-                    redis_client,
-                    queue_name
+                    redis_clients
                 )
                 futures.append(future)
 
@@ -524,17 +461,17 @@ if __name__ == "__main__":
                         if shutdown_event.is_set():
                             break
                         time.sleep(0.5)
-                    
+
                     if not shutdown_event.is_set():
                         future.result(timeout=1)
-                        
+
                 except Exception as e:
                     if not shutdown_event.is_set():
                         logger.error(f"Worker failed with exception: {e}")
-    
+
     except KeyboardInterrupt:
         pass  # Already handled by signal handler
-    
+
     finally:
         # Ensure all browsers are closed
         close_all_browsers()
@@ -542,22 +479,23 @@ if __name__ == "__main__":
     elapsed = time.time() - start_time
 
     try:
-        mq_connection.close()
-        logger.info("✅ RabbitMQ connection closed")
+        for name, client in redis_clients.items():
+            client.close()
+        logger.info("✅ Redis connections closed")
     except Exception as e:
-        logger.debug(f"Error closing RabbitMQ: {e}")
+        logger.debug(f"Error closing Redis: {e}")
 
     logger.info("=" * 60)
     logger.info("PROCESSING COMPLETE" if not shutdown_event.is_set() else "PROCESSING STOPPED")
     logger.info("=" * 60)
-    logger.info(f"Time elapsed:         {elapsed:.2f}s ({elapsed/60:.1f} min)")
-    logger.info(f"Workers used:         {MAX_WORKERS}")
-    logger.info(f"Consumer ID:          {CONSUMER_ID}")
+    logger.info(f"Time elapsed:           {elapsed:.2f}s ({elapsed/60:.1f} min)")
+    logger.info(f"Workers used:           {MAX_WORKERS}")
+    logger.info(f"Worker ID:              {WORKER_ID}")
     logger.info(f"Successfully processed: {total_stats['success']}")
-    logger.info(f"Rows written to CSV:  {total_stats['rows_written']}")
-    logger.info(f"Offline/Removed:      {total_stats['offline']}")
-    logger.info(f"Total errors:         {total_stats['errors']}")
-    logger.info(f"Captchas solved:      {total_stats['captchas_solved']}")
-    logger.info(f"Browser restarts:     {total_stats['browser_restarts']}")
-    logger.info(f"Results saved to:     {CSV_OUTPUT_FILE}")
+    logger.info(f"Offline/Removed:        {total_stats['offline']}")
+    logger.info(f"Retries:                {total_stats['retries']}")
+    logger.info(f"Failed permanently:     {total_stats['failed_permanent']}")
+    logger.info(f"Total errors:           {total_stats['errors']}")
+    logger.info(f"Captchas solved:        {total_stats['captchas_solved']}")
+    logger.info(f"Browser restarts:       {total_stats['browser_restarts']}")
     logger.info("=" * 60)
