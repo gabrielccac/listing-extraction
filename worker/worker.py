@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 for l in ["seleniumbase", "selenium", "pika"]: logging.getLogger(l).setLevel(logging.WARNING)
 
 # Configuration
-MAX_RETRIES = 3
+MAX_RETRIES = 3  # Max retries for failed URLs
+MAX_NAV_RETRIES = 3  # Max retries for navigation failures
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '3'))
 
 # Worker ID
@@ -241,7 +242,44 @@ def persistent_worker(worker_id, redis_clients):
             url_start_time = time.time()
 
             try:
-                sb.open(url)
+                # Navigation with retries
+                nav_success = False
+                for nav_attempt in range(MAX_NAV_RETRIES):
+                    try:
+                        sb.open(url)
+                        nav_success = True
+                        break
+                    except Exception as nav_error:
+                        logger.warning(f"[{thread_name}] Navigation attempt {nav_attempt+1}/{MAX_NAV_RETRIES} failed: {str(nav_error)[:100]}")
+
+                        if nav_attempt < MAX_NAV_RETRIES - 1:
+                            logger.info(f"[{thread_name}] 🔄 Restarting browser and retrying...")
+                            # Restart browser
+                            try:
+                                sb.driver.stop()
+                                with browsers_lock:
+                                    if sb in active_browsers:
+                                        active_browsers.remove(sb)
+                            except:
+                                pass
+
+                            try:
+                                sb = sb_cdp.Chrome(uc=True, uc_cdp_events=True, locale="pt-br")
+                                with browsers_lock:
+                                    active_browsers.append(sb)
+                                with results_lock:
+                                    total_stats['browser_restarts'] += 1
+                                logger.info(f"[{thread_name}] ✅ Browser restarted, retrying navigation...")
+                            except Exception as restart_error:
+                                logger.error(f"[{thread_name}] 🚨 Failed to restart browser: {restart_error}")
+                                break
+
+                if not nav_success:
+                    error_msg = f"Navigation failed after {MAX_NAV_RETRIES} attempts"
+                    logger.error(f"[{thread_name}] {error_msg} for {url}")
+                    url_stream.ack_message(message_id)
+                    handle_retry_or_fail(url, error_msg, retry_count, url_stream, failed_urls)
+                    continue
 
                 # Check shutdown after navigation
                 if shutdown_event.is_set():
