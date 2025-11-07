@@ -501,7 +501,7 @@ class ImovelwebScraper:
             historical_data = existing_data.get(url)
 
             if historical_data:
-                # URL exists in processed_urls
+                # URL exists in processed_urls (worker already scraped it)
                 historical_price = historical_data.get('price')
 
                 if historical_price == current_price:
@@ -509,22 +509,21 @@ class ImovelwebScraper:
                     stats['duplicates'] += 1
                     continue  # Skip: no stream publish, no processed_urls update
                 else:
-                    # PRICE CHANGE: update price in processed_urls, but don't publish to stream
-                    # (worker already scraped full details, we just need to update the price)
+                    # PRICE CHANGE: update price in processed_urls only
+                    # (worker already has full details, just update the price)
                     stats['price_changes'] += 1
-                    # Note: urls_to_publish NOT added - price changes don't need worker processing
+
+                    # Update only the price, preserve all other worker data
+                    processed_updates[url] = {
+                        **historical_data,  # Keep all existing worker data
+                        'price': current_price  # Update only price
+                    }
             else:
-                # NEW URL: publish to stream for worker to scrape full details
+                # NEW URL: publish to stream for worker to add to processed_urls
+                # Scraper does NOT add to processed_urls for new URLs
                 stats['new'] += 1
                 urls_to_publish.append((url, 'new'))
-
-            # Prepare processed_urls update (for NEW and PRICE_CHANGE, not duplicates)
-            processed_updates[url] = {
-                'price': current_price,
-                'last_seen': time.time(),
-                'first_seen': historical_data.get('first_seen', time.time()) if historical_data else time.time(),
-                **metadata
-            }
+                # Note: No processed_updates for NEW urls - worker will add the full record
 
         # ✅ BATCH 2: Update scrape_session in single HSET operation
         if scrape_session_updates:
@@ -537,7 +536,7 @@ class ImovelwebScraper:
         if urls_to_publish:
             self.url_stream.publish_urls_batch(urls_to_publish)
 
-        # ✅ BATCH 4: Update processed_urls in single HSET operation with mapping
+        # ✅ BATCH 4: Update processed_urls ONLY for price changes (not new URLs)
         if processed_updates:
             serialized_updates = {url: json.dumps(data) for url, data in processed_updates.items()}
             self.processed_urls.client.hset(

@@ -110,18 +110,17 @@ class ProcessedUrlsClient(RedisClient):
     def update_url_price(self, url: str, price: int, metadata: Dict = None):
         """Update URL price in processed store (preserves existing data)."""
         existing_data = self.get_url_data(url) or {}
-        
+
         updated_data = {
             **existing_data,
             'price': price,
-            'last_seen': time.time(),
             **(metadata or {})
         }
-        
+
         # Ensure first_seen is preserved
         if 'first_seen' not in updated_data:
             updated_data['first_seen'] = time.time()
-        
+
         self.client.hset(self.processed_key, url, json.dumps(updated_data))
     
     def update_full_data(self, url: str, property_data: Dict):
