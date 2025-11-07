@@ -210,7 +210,26 @@ class ImovelwebScraper:
         except Exception as e:
             logger.warning(f"Page load verification failed: {str(e)[:100]}")
 
-            # Save screenshot of failed page load
+            # Check if it's a captcha page before giving up
+            if self.is_captcha_page():
+                logger.warning("⚠️  Captcha detected during page load verification")
+                if self.handle_captcha():
+                    # Captcha solved, try verifying page load again
+                    try:
+                        self.sb.wait_for_element_visible(
+                            self.PAGE_LOADED_SELECTOR,
+                            timeout=self.LOAD_TIMEOUT
+                        )
+                        logger.info("✅ Page loaded after captcha resolution")
+                        return True
+                    except:
+                        logger.error("Page still not loaded after captcha resolution")
+                        return False
+                else:
+                    logger.error("Failed to handle captcha during page load verification")
+                    return False
+
+            # Not a captcha, genuine page load failure - save screenshot
             try:
                 timestamp = time.time_ns()
                 current_url = self.sb.get_current_url()
