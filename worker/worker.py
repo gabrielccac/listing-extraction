@@ -8,11 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from seleniumbase import sb_cdp
 
-# Add parent directory to path to import from provider
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-# Import from our modules
-from provider.redis_client import create_redis_clients
+# Import from local modules
+from redis_client import create_redis_clients
 from parser import parse_property_data
 
 # Site-specific configuration

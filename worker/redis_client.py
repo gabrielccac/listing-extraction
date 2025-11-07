@@ -42,34 +42,6 @@ class RedisClient:
             self.client.close()
             logger.debug("Redis connection closed")
 
-class ScrapeSessionClient(RedisClient):
-    """
-    Manages scrape session data for intra-session tracking and expired detection.
-    """
-    
-    def __init__(self, site_name: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.site_name = site_name
-        self.scrape_session_key = f"scrape_session_{site_name}"
-    
-    def update_url_price(self, url: str, price: int):
-        """Update URL price in current scrape session (overwrites existing)."""
-        self.client.hset(self.scrape_session_key, url, price)
-    
-    def get_url_price(self, url: str) -> Optional[int]:
-        """Get URL price from current scrape session."""
-        price = self.client.hget(self.scrape_session_key, url)
-        return int(price) if price else None
-    
-    def get_all_urls(self) -> List[str]:
-        """Get all URLs from current scrape session."""
-        return list(self.client.hkeys(self.scrape_session_key))
-    
-    def clear_session(self):
-        """Clear current scrape session (call at start of new session)."""
-        self.client.delete(self.scrape_session_key)
-        logger.info("🧹 Cleared scrape session")
-
 class ProcessedUrlsClient(RedisClient):
     """
     Manages processed URLs with full JSON data for deduplication and worker results.
@@ -238,23 +210,62 @@ class UrlStreamClient(RedisClient):
         except Exception as e:
             logger.error(f"Stream consumption error: {e}")
             return []
-
+    
     def ack_message(self, message_id: str):
         """Acknowledge message processing."""
         self.client.xack(self.stream_key, self.consumer_group, message_id)
-
+    
     def get_pending_count(self) -> int:
         """Get number of pending messages."""
         pending_info = self.client.xpending(self.stream_key, self.consumer_group)
         return pending_info['pending'] if pending_info else 0
 
-# Factory function for scraper
+class FailedUrlsClient(RedisClient):
+    """
+    Manages failed URLs that couldn't be processed after max retries.
+    Stores URL → error message for debugging.
+    """
+
+    def __init__(self, site_name: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.site_name = site_name
+        self.failed_key = f"failed_urls_{site_name}"
+
+    def add_failed_url(self, url: str, error_message: str):
+        """Store a failed URL with error message."""
+        self.client.hset(self.failed_key, url, error_message)
+        logger.debug(f"❌ Stored failed URL: {url[:80]}")
+
+    def get_error(self, url: str) -> Optional[str]:
+        """Get error message for a failed URL."""
+        return self.client.hget(self.failed_key, url)
+
+    def remove_url(self, url: str):
+        """Remove URL from failed list (after successful retry)."""
+        self.client.hdel(self.failed_key, url)
+        logger.debug(f"✅ Removed from failed URLs: {url[:80]}")
+
+    def get_all_failed_urls(self) -> List[str]:
+        """Get all failed URLs."""
+        return list(self.client.hkeys(self.failed_key))
+
+    def get_failed_count(self) -> int:
+        """Get count of failed URLs."""
+        return self.client.hlen(self.failed_key)
+
+    def clear_all(self):
+        """Clear all failed URLs (use after batch retry)."""
+        count = self.get_failed_count()
+        self.client.delete(self.failed_key)
+        logger.info(f"🧹 Cleared {count} failed URLs")
+
+# Factory function for worker
 def create_redis_clients(site_name: str, host: str, port: int, password: str):
-    """Create Redis clients needed for scraper."""
+    """Create Redis clients needed for worker."""
     clients = {
-        'scrape_session': ScrapeSessionClient(site_name, host, port, password, db=0),
         'processed_urls': ProcessedUrlsClient(site_name, host, port, password, db=0),
         'url_stream': UrlStreamClient(site_name, host, port, password, db=0),
+        'failed_urls': FailedUrlsClient(site_name, host, port, password, db=0)
     }
 
     # Connect all clients
