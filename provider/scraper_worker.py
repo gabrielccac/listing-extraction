@@ -210,8 +210,19 @@ class ImovelwebScraper:
         except Exception as e:
             logger.warning(f"Page load verification failed: {str(e)[:100]}")
 
+            # Debug: Log current page state for troubleshooting
+            try:
+                current_title = self.sb.get_title()
+                current_url = self.sb.get_current_url()
+                logger.info(f"Debug - Page title: '{current_title}' | URL: {current_url[:80]}")
+            except Exception as debug_e:
+                logger.debug(f"Could not get page info for debugging: {str(debug_e)[:100]}")
+
             # Check if it's a captcha page before giving up
-            if self.is_captcha_page():
+            is_captcha = self.is_captcha_page()
+            logger.info(f"Captcha detection result: {is_captcha}")
+
+            if is_captcha:
                 logger.warning("⚠️  Captcha detected during page load verification")
                 if self.handle_captcha():
                     # Captcha solved, try verifying page load again
