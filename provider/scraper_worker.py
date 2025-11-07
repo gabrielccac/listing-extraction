@@ -313,30 +313,66 @@ class ImovelwebScraper:
     
     def handle_captcha(self, max_wait: int = 60) -> bool:
         """
-        Wait for SeleniumBase UC mode to solve captcha.
+        Handle captcha with multiple fallback methods.
+
+        Strategy:
+        1. Wait for UC mode auto-solve (60s)
+        2. If fails, try gui_click_captcha()
+        3. If fails, try solve_captcha()
 
         Args:
-            max_wait: Maximum time to wait (seconds, default 60)
+            max_wait: Maximum time to wait for UC mode (seconds, default 60)
 
         Returns:
             True if captcha cleared
         """
-        logger.warning("⚠️ Captcha detected! Waiting for UC mode to handle it...")
-        
+        logger.warning("⚠️  Captcha detected! Trying UC mode auto-solve...")
+
+        # Method 1: UC mode auto-solve (passive waiting)
         start_time = time.time()
         while time.time() - start_time < max_wait:
             # Check if title changed (captcha cleared)
             try:
                 title = self.sb.get_title()
                 if "Um momento" not in title:
-                    logger.info("✅ Captcha cleared successfully")
+                    logger.info("✅ Captcha cleared by UC mode!")
                     return True
             except:
                 pass
-            
+
             time.sleep(1)
-        
-        logger.error("🚫 Captcha not cleared within timeout")
+
+        logger.warning("UC mode timeout - trying fallback methods...")
+
+        # Method 2: gui_click_captcha()
+        try:
+            logger.info("Trying gui_click_captcha()...")
+            self.sb.gui_click_captcha()
+            time.sleep(3)  # Wait for captcha to process
+
+            # Check if cleared
+            title = self.sb.get_title()
+            if "Um momento" not in title:
+                logger.info("✅ Captcha cleared by gui_click_captcha()!")
+                return True
+        except Exception as e:
+            logger.debug(f"gui_click_captcha() failed: {str(e)[:100]}")
+
+        # Method 3: solve_captcha()
+        try:
+            logger.info("Trying solve_captcha()...")
+            self.sb.solve_captcha()
+            time.sleep(3)  # Wait for captcha to process
+
+            # Check if cleared
+            title = self.sb.get_title()
+            if "Um momento" not in title:
+                logger.info("✅ Captcha cleared by solve_captcha()!")
+                return True
+        except Exception as e:
+            logger.debug(f"solve_captcha() failed: {str(e)[:100]}")
+
+        logger.error("🚫 All captcha solving methods failed")
         return False
     
     # ========================================================================
