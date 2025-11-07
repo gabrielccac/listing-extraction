@@ -1,3 +1,5 @@
 venv/
 env/
 __pycache__/
+failed_urls/
+imovelweb_listings_*
