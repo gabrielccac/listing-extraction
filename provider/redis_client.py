@@ -282,6 +282,45 @@ class DbSyncClient(RedisClient):
         """Remove URL from db_sync."""
         self.client.hdel(self.db_sync_key, url)
 
+class FailedUrlsClient(RedisClient):
+    """
+    Manages failed URLs that couldn't be processed after max retries.
+    Stores URL → error message for debugging.
+    """
+
+    def __init__(self, site_name: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.site_name = site_name
+        self.failed_key = f"failed_urls_{site_name}"
+
+    def add_failed_url(self, url: str, error_message: str):
+        """Store a failed URL with error message."""
+        self.client.hset(self.failed_key, url, error_message)
+        logger.debug(f"❌ Stored failed URL: {url[:80]}")
+
+    def get_error(self, url: str) -> Optional[str]:
+        """Get error message for a failed URL."""
+        return self.client.hget(self.failed_key, url)
+
+    def remove_url(self, url: str):
+        """Remove URL from failed list (after successful retry)."""
+        self.client.hdel(self.failed_key, url)
+        logger.debug(f"✅ Removed from failed URLs: {url[:80]}")
+
+    def get_all_failed_urls(self) -> List[str]:
+        """Get all failed URLs."""
+        return list(self.client.hkeys(self.failed_key))
+
+    def get_failed_count(self) -> int:
+        """Get count of failed URLs."""
+        return self.client.hlen(self.failed_key)
+
+    def clear_all(self):
+        """Clear all failed URLs (use after batch retry)."""
+        count = self.get_failed_count()
+        self.client.delete(self.failed_key)
+        logger.info(f"🧹 Cleared {count} failed URLs")
+
 # Factory functions for easy creation
 def create_redis_clients(site_name: str, host: str, port: int, password: str):
     """Create all Redis clients for a site."""
@@ -289,14 +328,15 @@ def create_redis_clients(site_name: str, host: str, port: int, password: str):
         'scrape_session': ScrapeSessionClient(site_name, host, port, password, db=0),
         'processed_urls': ProcessedUrlsClient(site_name, host, port, password, db=0),
         'url_stream': UrlStreamClient(site_name, host, port, password, db=0),
-        'db_sync': DbSyncClient(site_name, host, port, password, db=1)  # Separate DB
+        'db_sync': DbSyncClient(site_name, host, port, password, db=1),  # Separate DB
+        'failed_urls': FailedUrlsClient(site_name, host, port, password, db=0)
     }
-    
+
     # Connect all clients
     for name, client in clients.items():
         client.connect()
-    
+
     # Ensure stream consumer group exists
     clients['url_stream'].create_consumer_group()
-    
+
     return clients
